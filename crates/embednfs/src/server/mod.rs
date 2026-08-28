@@ -15,12 +15,45 @@ use embednfs_proto::*;
 
 use crate::fs::*;
 use crate::internal::ObjectId;
-use crate::session::StateManager;
+use crate::session::{MAX_FORE_CHAN_SLOTS, StateManager};
 
 const RPC_LAST_FRAGMENT: u32 = 0x8000_0000;
 const RPC_FRAG_LEN_MASK: u32 = 0x7fff_ffff;
-const MAX_FRAGMENT_SIZE: usize = 2 * 1024 * 1024;
+const MAX_FRAGMENT_SIZE_U32: u32 = 2 * 1024 * 1024;
+const MAX_FRAGMENT_SIZE: usize = MAX_FRAGMENT_SIZE_U32 as usize;
 const CONN_BUF_SIZE: usize = 65_536;
+
+/// Default number of COMPOUND requests a single connection may execute
+/// concurrently.
+///
+/// This matches the advertised NFSv4.1 forechannel slot limit
+/// (`fore_chan_attrs.maxrequests`), so a client that keeps every slot of *one*
+/// session busy is never throttled by the server.
+///
+/// The budget is per connection and the slot table is per session, so a client
+/// that pipelines beyond its slot table — or runs several sessions over one
+/// connection — is bounded by it, as is any client when this is configured
+/// lower. That is deliberate backpressure: the excess waits in the socket
+/// receive buffer under TCP flow control rather than in server memory, and is
+/// delayed rather than failed. See `docs/concurrency.md`.
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = MAX_FORE_CHAN_SLOTS as usize;
+
+/// Permits in a connection's control gate.
+///
+/// One permit is a shared (forechannel) holder; taking all of them is the
+/// exclusive lane. Both the gate's capacity and an exclusive acquisition are
+/// spelled from this single value, so the two can never drift apart and leave
+/// the exclusive lane permanently unsatisfiable.
+const CONTROL_GATE_PERMITS: u32 = 1024;
+
+/// Hard upper bound for [`NfsServerBuilder::max_concurrent_requests`].
+///
+/// Per-connection concurrency is always bounded: requests are not read off the
+/// socket until execution capacity is available, so this value also caps how
+/// many request and response bodies a connection can hold in memory. It equals
+/// the control gate's capacity, so a connection running at the maximum can
+/// still fill the shared lane.
+pub const MAX_CONCURRENT_REQUESTS_LIMIT: usize = CONTROL_GATE_PERMITS as usize;
 
 type NfsResult<T> = FsResult<T>;
 
@@ -28,6 +61,7 @@ mod compound;
 mod file_attrs;
 mod objects;
 mod ops;
+mod response_budget;
 mod transport;
 
 /// Maps numeric ids to NFS owner/group strings.
@@ -56,12 +90,25 @@ impl IdMapper for NumericIdMapper {
 pub struct NfsServerBuilder<F: FileSystem> {
     fs: F,
     id_mapper: Arc<dyn IdMapper>,
+    max_concurrent_requests: usize,
 }
 
 impl<F: FileSystem> NfsServerBuilder<F> {
     /// Replaces the uid/gid string mapper used for `owner` attributes.
     pub fn id_mapper<M: IdMapper>(mut self, mapper: M) -> Self {
         self.id_mapper = Arc::new(mapper);
+        self
+    }
+
+    /// Sets how many COMPOUND requests one connection may execute concurrently.
+    ///
+    /// Defaults to [`DEFAULT_MAX_CONCURRENT_REQUESTS`]. The value is clamped to
+    /// `1..=`[`MAX_CONCURRENT_REQUESTS_LIMIT`]; `1` restores fully serialized
+    /// request handling. Because capacity is acquired before the next RPC
+    /// record is read, this limit bounds both in-flight filesystem work and the
+    /// number of buffered request/response bodies per connection.
+    pub fn max_concurrent_requests(mut self, limit: usize) -> Self {
+        self.max_concurrent_requests = limit.clamp(1, MAX_CONCURRENT_REQUESTS_LIMIT);
         self
     }
 
@@ -74,6 +121,7 @@ impl<F: FileSystem> NfsServerBuilder<F> {
             object_to_handle: Arc::new(RwLock::new(HashMap::new())),
             next_object_id: AtomicU64::new(1),
             id_mapper: self.id_mapper,
+            max_concurrent_requests: self.max_concurrent_requests,
         }
     }
 }
@@ -86,6 +134,7 @@ pub struct NfsServer<F: FileSystem> {
     object_to_handle: Arc<RwLock<HashMap<ObjectId, F::Handle>>>,
     next_object_id: AtomicU64,
     id_mapper: Arc<dyn IdMapper>,
+    max_concurrent_requests: usize,
 }
 
 impl<F: FileSystem> NfsServer<F> {
@@ -94,6 +143,7 @@ impl<F: FileSystem> NfsServer<F> {
         NfsServerBuilder {
             fs,
             id_mapper: Arc::new(NumericIdMapper),
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
         }
     }
 
